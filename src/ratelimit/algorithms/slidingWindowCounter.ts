@@ -21,6 +21,7 @@ export class SlidingWindowCounter implements RateLimitAlgorithm {
 
     let state: CounterState = await this.backend.get(key)
 
+    
     if (!state) {
       state = {
         currentWindowStart: now,
