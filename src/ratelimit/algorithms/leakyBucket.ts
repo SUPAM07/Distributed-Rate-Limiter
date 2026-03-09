@@ -6,6 +6,7 @@ interface BucketState {
   lastLeak: number
 }
 
+
 export class LeakyBucket implements RateLimitAlgorithm {
 
   constructor(
