@@ -46,6 +46,7 @@ export class SlidingWindowCounter implements RateLimitAlgorithm {
       state.currentWindowStart = now
     }
 
+    
     const weight = (this.windowMs - (now - state.currentWindowStart)) / this.windowMs
 
     const effectiveCount =
