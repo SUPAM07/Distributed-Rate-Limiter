@@ -7,6 +7,7 @@ interface CounterState {
   previousCount: number
 }
 
+
 export class SlidingWindowCounter implements RateLimitAlgorithm {
 
   constructor(
