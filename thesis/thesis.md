@@ -313,6 +313,81 @@ The **service layer** is where the business logic lives. `ConfigurationResolver`
 
 The **backend layer** abstracts the choice of storage. `RedisRateLimiterBackend` executes Lua scripts for each algorithm. `InMemoryRateLimiterBackend` maintains a `ConcurrentHashMap` of algorithm instances.
 
+#### Request Lifecycle — Sequence Diagram
+
+The following sequence diagram traces a single `POST /api/ratelimit/check` request through the full stack for the standard (non-geographic, non-composite) path:
+
+```
+ Client          SecurityFilter    RateLimitController   RateLimiterService   ConfigResolver   DistributedRLS   Redis
+   │                   │                   │                     │                  │                │              │
+   │──POST /check──────►                   │                     │                  │                │              │
+   │                   │                   │                     │                  │                │              │
+   │         [IP check, API key, size]     │                     │                  │                │              │
+   │                   │──chain.doFilter()─►                     │                  │                │              │
+   │                   │                   │                     │                  │                │              │
+   │                   │     [extract clientIp, build effectiveKey]                 │                │              │
+   │                   │                   │──isAllowed(key,n)───►                  │                │              │
+   │                   │                   │                     │──resolveConfig(key)►              │              │
+   │                   │                   │                     │                  │──schedule?──┐  │              │
+   │                   │                   │                     │                  │  exact key? │  │              │
+   │                   │                   │                     │                  │  pattern?   │  │              │
+   │                   │                   │                     │                  │  default    │  │              │
+   │                   │                   │                     │◄─RateLimitConfig─┘             │  │              │
+   │                   │                   │                     │──getAvailableBackend()──────────►  │              │
+   │                   │                   │                     │                                 │──isAvailable()─►
+   │                   │                   │                     │                                 │◄──true──────────
+   │                   │                   │                     │◄──RedisRateLimiterBackend───────┘  │              │
+   │                   │                   │                     │──getRateLimiter(key,config)──────────────────────►
+   │                   │                   │                     │                                                  │
+   │                   │                   │                     │──tryConsume(n)  [executes Lua script atomically]─►
+   │                   │                   │                     │◄──{success=1, tokens=7, …}────────────────────────
+   │                   │                   │◄──true──────────────┘
+   │                   │                   │
+   │                   │    [record metrics, build AdaptiveInfo]
+   │◄──200 OK {allowed:true}───────────────┘
+```
+
+If Redis is unavailable the `getAvailableBackend()` call returns `InMemoryRateLimiterBackend` instead, and the Lua execution step is replaced by a synchronised Java method call on the local `TokenBucket` instance.
+
+#### RateLimiter Interface and Class Hierarchy
+
+All five algorithm implementations share the `RateLimiter` interface:
+
+```
+                        «interface»
+                        RateLimiter
+                        ───────────
+                        +tryConsume(int tokens) : boolean
+                        +getCurrentTokens()     : int
+                        +getCapacity()          : int
+                        +getRefillRate()        : int
+                        +getLastRefillTime()    : long
+                              │
+          ┌───────────────────┼──────────────────────────────┐
+          │                   │                              │
+   TokenBucket          SlidingWindow                  FixedWindow
+   (synchronized)       (ConcurrentLinkedDeque)        (AtomicInteger +
+                                                         volatile long)
+          │
+   RedisTokenBucket            LeakyBucket           CompositeRateLimiter
+   (Lua + RedisTemplate)       (BlockingQueue +       (List<LimitComponent> +
+                                ScheduledExecutor)     CombinationLogic)
+
+                        «interface»
+                        RateLimiterBackend
+                        ─────────────────
+                        +getRateLimiter(key, config) : RateLimiter
+                        +isAvailable()               : boolean
+                        +clear()
+                        +getActiveCount()            : int
+                              │
+               ┌──────────────┴───────────────┐
+               │                              │
+   RedisRateLimiterBackend      InMemoryRateLimiterBackend
+   (dispatches to               (ConcurrentHashMap<String, BucketHolder>
+    Redis* classes)              lazy eviction via ScheduledExecutorService)
+```
+
 ### 3.3 Algorithm Design Decisions
 
 #### Token Bucket (default) — ADR-001
@@ -331,6 +406,64 @@ Fields: tokens          (current token count, integer)
         capacity        (maximum tokens, integer)
         refill_rate     (tokens per second, integer)
 TTL:    86400 seconds (24 hours of inactivity cleanup)
+```
+
+**Redis memory layout for a single Token Bucket key:**
+
+```
+Redis Hash key: "rate_limit:user:alice"
+┌──────────────┬──────────────────────────────────────────────────────┐
+│ Field        │ Value (example)                                      │
+├──────────────┼──────────────────────────────────────────────────────┤
+│ tokens       │ 7            ← 7 of 10 tokens remaining              │
+│ last_refill  │ 1714559400000 ← epoch ms of last refill              │
+│ capacity     │ 10           ← maximum burst size                    │
+│ refill_rate  │ 2            ← tokens added per second               │
+└──────────────┴──────────────────────────────────────────────────────┘
+TTL: 85843 seconds remaining (24h inactivity cleanup)
+```
+
+**Algorithm backend dispatch** — `RedisRateLimiterBackend.getRateLimiter()` selects the appropriate Redis-backed implementation based on the resolved config:
+
+```java
+// RedisRateLimiterBackend.java (lines 27–41)
+@Override
+public RateLimiter getRateLimiter(String key, RateLimitConfig config) {
+    String redisKey = keyPrefix + key;          // "rate_limit:user:alice"
+
+    switch (config.getAlgorithm()) {
+        case TOKEN_BUCKET:
+            return new RedisTokenBucket(redisKey, config.getCapacity(),
+                                        config.getRefillRate(), redisTemplate);
+        case SLIDING_WINDOW:
+            // Falls back to token-bucket.lua — sorted-set implementation is future work
+            return new RedisTokenBucket(redisKey, config.getCapacity(),
+                                        config.getRefillRate(), redisTemplate);
+        case FIXED_WINDOW:
+            return new RedisFixedWindow(redisKey, config.getCapacity(),
+                                        config.getRefillRate(), redisTemplate);
+        default:
+            throw new IllegalArgumentException("Unknown algorithm: " + config.getAlgorithm());
+    }
+}
+```
+
+The in-memory equivalent in `InMemoryRateLimiterBackend.createRateLimiter()` follows the same switch pattern but instantiates local Java objects instead of Redis-backed classes:
+
+```java
+// InMemoryRateLimiterBackend.java (lines 104–115)
+private RateLimiter createRateLimiter(RateLimitConfig config) {
+    switch (config.getAlgorithm()) {
+        case TOKEN_BUCKET:
+            return new TokenBucket(config.getCapacity(), config.getRefillRate());
+        case SLIDING_WINDOW:
+            return new SlidingWindow(config.getCapacity(), config.getRefillRate());
+        case FIXED_WINDOW:
+            return new FixedWindow(config.getCapacity(), config.getRefillRate());
+        default:
+            throw new IllegalArgumentException("Unknown algorithm: " + config.getAlgorithm());
+    }
+}
 ```
 
 #### Redis Lua Scripts for Atomicity — ADR-002
@@ -366,6 +499,33 @@ The `CombinationLogic` enum determines how component results are combined:
 
 **TOCTOU limitation in ALL_MUST_PASS.** The `tryConsumeAllMustPass()` method first calls `wouldAllow()` (which reads `getCurrentTokens()`) on each component, then calls `tryConsume()` on each. Between the check phase and the consume phase, another thread could change the state of a component. This is a TOCTOU (Time-of-Check / Time-of-Use) race. In the in-memory implementation, this risk is mitigated by `synchronized` on each individual bucket but not across the composite. In the distributed implementation, a truly atomic composite would require a multi-key Lua script, which is significantly more complex. This limitation is acknowledged in Chapter 5.
 
+**ALL_MUST_PASS two-phase decision flow:**
+
+```
+     Request tokens=1 arrives at CompositeRateLimiter (ALL_MUST_PASS)
+                               │
+              ┌────────────────┼────────────────┐
+              │                │                │
+        wouldAllow?       wouldAllow?      wouldAllow?
+        api_calls(TB)     bandwidth(LB)   compliance(FW)
+              │                │                │
+          tokens=7 → ✅    queue=48 → ❌    count=3 → ✅
+              │                │                │
+              └────────────────┼────────────────┘
+                          ANY = false
+                               │
+                        ┌──────▼──────┐
+                        │  ALL_MUST   │  At least one component denied →
+                        │  PASS fails │  SKIP consume phase entirely
+                        └──────┬──────┘  (no tokens consumed from any component)
+                               │
+                         return false
+                         allowed = false
+                         limitingComponent = "bandwidth"
+```
+
+Note that when ALL_MUST_PASS fails, **no** component is consumed from. This is the purpose of the two-phase check: avoiding partial state mutation. The TOCTOU risk only applies when all components return `true` in the check phase but one transitions to `false` before the consume phase completes under high concurrency.
+
 ### 3.5 Configuration Resolution Hierarchy
 
 `ConfigurationResolver` applies the following priority order when determining the effective limits for a key:
@@ -380,6 +540,72 @@ The `CombinationLogic` enum determines how component results are combined:
 Wildcard patterns use `*` as a glob wildcard. Internally, `*` is converted to the regex `.*` with all other special regex characters in the pattern escaped first — this is an important security consideration, as an unescaped pattern like `api.v1.*` would match `apixv1y` (because `.` is a regex wildcard). The project escapes `.`, `+`, `?`, `(`, `)`, `[`, `]`, `{`, `}`, and `^` before substituting `*` → `.*`.
 
 Results of configuration resolution are cached. When a configuration is updated via the `RateLimitConfigController`, the cache is invalidated by calling `configurationResolver.clearCache()`.
+
+**Configuration resolution flowchart** — `ConfigurationResolver.resolveConfig(key)`:
+
+```
+resolveConfig("user:alice")
+         │
+         ▼
+  ┌──────────────────────────────────────────────────────┐
+  │ 1. Check cache: configCache.get("user:alice")        │
+  │    cache hit? ──yes──► return cached RateLimitConfig │
+  └──────────────────┬───────────────────────────────────┘
+                     │ (cache miss)
+                     ▼
+  ┌──────────────────────────────────────────────────────┐
+  │ 2. Ask ScheduleManagerService:                       │
+  │    getActiveConfig("user:alice")                     │
+  │    active schedule? ──yes──► use schedule config     │
+  └──────────────────┬───────────────────────────────────┘
+                     │ (no active schedule)
+                     ▼
+  ┌──────────────────────────────────────────────────────┐
+  │ 3. Check exact key map:                              │
+  │    keys.get("user:alice")                            │
+  │    found? ──yes──► use per-key config                │
+  └──────────────────┬───────────────────────────────────┘
+                     │ (not in exact map)
+                     ▼
+  ┌──────────────────────────────────────────────────────┐
+  │ 4. Iterate pattern map:                              │
+  │    for pattern in patterns.keySet():                 │
+  │      if matchesPattern("user:alice", "user:*") → ✅  │
+  │      use pattern config                              │
+  └──────────────────┬───────────────────────────────────┘
+                     │ (no pattern matched)
+                     ▼
+  ┌──────────────────────────────────────────────────────┐
+  │ 5. Return global default:                            │
+  │    RateLimitConfig(capacity=10, refillRate=2, …)     │
+  └──────────────────────────────────────────────────────┘
+                     │
+         Store result in configCache
+         return RateLimitConfig
+```
+
+**Wildcard pattern matching** — the `*` glob is converted to a regex with all other special characters escaped to prevent injection:
+
+```java
+// ConfigurationResolver.matchesPattern(key, pattern) — security-critical section
+private boolean matchesPattern(String key, String pattern) {
+    if (pattern.equals("*")) return true;
+    if (!pattern.contains("*")) return key.equals(pattern);
+
+    // Escape all regex metacharacters BEFORE replacing * with .*
+    // Without this, "api.v1.*" would incorrectly match "apixv1y" because '.' is a
+    // regex wildcard. Escaping ensures only '*' acts as a wildcard.
+    String regex = pattern
+        .replace("\\", "\\\\").replace(".", "\\.").replace("+", "\\+")
+        .replace("?", "\\?").replace("^", "\\^").replace("$", "\\$")
+        .replace("|", "\\|").replace("(", "\\(").replace(")", "\\)")
+        .replace("[", "\\[").replace("]", "\\]")
+        .replace("{", "\\{").replace("}", "\\}")
+        .replace("*", ".*");          // ← only after all other escaping
+
+    return key.matches("^" + regex + "$");
+}
+```
 
 ### 3.6 Adaptive Rate Limiting Design
 
@@ -411,6 +637,88 @@ TrafficPatternAnalyzer
 
 Decisions are only applied if confidence ≥ 0.70. Safety constraints prevent capacity from dropping below 10 or rising above 100,000, and no single adjustment can change capacity by more than a factor of 2×.
 
+**Z-score anomaly detection** — `AnomalyDetector.calculateZScore()` (lines 129–135):
+
+```java
+// AnomalyDetector.java — core statistical calculation
+private double calculateZScore(TrafficStats current, TrafficStats baseline) {
+    if (baseline.stdDev == 0) {
+        return 0.0;   // Avoid division by zero for perfectly stable baselines
+    }
+    // Standard z-score: how many standard deviations is the current mean
+    // above (positive) or below (negative) the historical baseline mean
+    return (current.mean - baseline.mean) / baseline.stdDev;
+}
+
+private String calculateSeverity(double zScore) {
+    double absZ = Math.abs(zScore);
+    if (absZ < 3.0)  return "NONE";      // p > 0.003, normal variation
+    if (absZ < 4.0)  return "LOW";       // ~0.003 > p > 0.00006
+    if (absZ < 5.0)  return "MEDIUM";
+    if (absZ < 6.0)  return "HIGH";
+    return "CRITICAL";                    // z > 6: extremely rare under normal traffic
+}
+```
+
+The baseline `mean` and `stdDev` are updated on every 100th data point from a rolling window of up to 1,000 observations (`BASELINE_WINDOW = 1000`). This gives the detector time to learn a stable baseline before making adaptation decisions.
+
+**Rule-based decision engine** — `AdaptiveMLModel.makeRuleBasedDecision()` (lines 87–156, summarised):
+
+```java
+// AdaptiveMLModel.java — five rules in priority order
+private DecisionOutput makeRuleBasedDecision(double[] features,
+                                             SystemHealth health,
+                                             AnomalyScore anomaly,
+                                             int currentCapacity,
+                                             int currentRefillRate) {
+    DecisionOutput out = new DecisionOutput();
+    out.capacity = currentCapacity; out.refillRate = currentRefillRate;
+
+    // Rule 1: System stress — tighten limits immediately
+    if (health.getCpuUtilization() > 0.8 || health.getResponseTimeP95() > 2000) {
+        out.capacity   = (int)(currentCapacity   * 0.7);   // −30%
+        out.refillRate = (int)(currentRefillRate * 0.7);
+        out.confidence = 0.85;
+        out.shouldAdapt = true;
+        return out;
+    }
+    // Rule 2: Critical anomaly — aggressive reduction
+    if (anomaly.isAnomaly() && "CRITICAL".equals(anomaly.getSeverity())) {
+        out.capacity   = (int)(currentCapacity   * 0.6);   // −40%
+        out.confidence = 0.90;
+        out.shouldAdapt = true;
+        return out;
+    }
+    // Rule 3: High/Medium anomaly — moderate reduction
+    if (anomaly.isAnomaly() &&
+        ("HIGH".equals(anomaly.getSeverity()) || "MEDIUM".equals(anomaly.getSeverity()))) {
+        out.capacity   = (int)(currentCapacity   * 0.8);   // −20%
+        out.confidence = 0.75;
+        out.shouldAdapt = true;
+        return out;
+    }
+    // Rule 4: Lots of headroom — increase limits
+    if (health.getCpuUtilization() < 0.3 && health.getErrorRate() < 0.001 && !anomaly.isAnomaly()) {
+        out.capacity   = (int)(currentCapacity   * 1.3);   // +30%
+        out.confidence = 0.75;
+        out.shouldAdapt = true;
+        return out;
+    }
+    // Rule 5: Moderate headroom — small increase
+    if (health.getCpuUtilization() < 0.5 && health.getErrorRate() < 0.005 && !anomaly.isAnomaly()) {
+        out.capacity   = (int)(currentCapacity   * 1.1);   // +10%
+        out.confidence = 0.65;
+        out.shouldAdapt = true;
+        return out;
+    }
+    // No adaptation
+    out.reason = "System stable, no adaptation needed";
+    return out;
+}
+```
+
+Safety constraints are applied after the rule fires: `adaptedCapacity = Math.max(minCapacity, Math.min(maxCapacity, Math.min(newCapacity, currentCapacity * MAX_ADJUSTMENT_FACTOR)))`, where `MAX_ADJUSTMENT_FACTOR = 2.0` and `minCapacity = 10`.
+
 ### 3.7 Geographic Rate Limiting Design
 
 The geographic module follows a header priority chain to determine request origin:
@@ -430,6 +738,61 @@ Country codes are mapped to compliance zones:
 A geographic key is synthesised as: `geo:{countryCode}:{complianceZone}:{originalKey}`
 
 This allows an operator to configure `ratelimiter.patterns.geo:DE:GDPR:*.capacity=5` to apply stricter limits to all requests from Germany while leaving other keys unaffected.
+
+**Geographic detection and key synthesis flow:**
+
+```
+HTTP Request arrives at RateLimitController
+              │
+              ▼
+  extractGeographicHeaders(httpRequest)
+  ┌──────────────────────────────────────────────────────────────┐
+  │ Priority order (first non-null header wins):                 │
+  │  1. CF-IPCountry          (Cloudflare)          → "DE"      │
+  │  2. CF-IPContinent        (Cloudflare)           → "EU"     │
+  │  3. CloudFront-Viewer-Country  (AWS)             → "DE"     │
+  │  4. X-MS-Country-Code     (Azure CDN)            → "DE"     │
+  │  5. X-Country / X-GeoIP-Country (generic)        → "DE"     │
+  │  6. clientInfo.countryCode (request body)        → "DE"     │
+  │  Fallback: countryCode = "UNKNOWN"                          │
+  └──────────────────────────────────────────────────────────────┘
+              │ countryCode = "DE"
+              ▼
+  Map country to compliance zone:
+  ┌────────────────────────────────────────────────────────────┐
+  │  EU member states  →  ComplianceZone.GDPR                 │
+  │  US-CA (California) → ComplianceZone.CCPA                 │
+  │  All others         → ComplianceZone.STANDARD             │
+  └────────────────────────────────────────────────────────────┘
+              │ zone = GDPR
+              ▼
+  createGeographicKey(originalKey="api:user:alice", geoLocation)
+     → "geo:DE:GDPR:api:user:alice"
+              │
+              ▼
+  ConfigurationResolver.resolveConfig("geo:DE:GDPR:api:user:alice")
+  matches pattern: ratelimiter.patterns.geo:*:GDPR:*.capacity=5
+              │
+              ▼
+  RateLimiterService.isAllowed("geo:DE:GDPR:api:user:alice", tokens)
+  → applies GDPR-specific limit (capacity=5) instead of global default (capacity=10)
+```
+
+The geographic key synthesis is implemented in `GeographicRateLimitService.createGeographicKey()`:
+
+```java
+// GeographicRateLimitService.java (lines 145–150)
+private String createGeographicKey(String originalKey, GeoLocation geoLocation) {
+    // Produces a namespaced key that keeps geographic buckets separate from
+    // standard buckets for the same logical key.
+    return String.format("geo:%s:%s:%s",
+        geoLocation.getCountryCode(),          // e.g. "DE"
+        geoLocation.getComplianceZone().name(), // e.g. "GDPR"
+        originalKey);                          // e.g. "api:user:alice"
+}
+```
+
+This design ensures that `api:user:alice` from Germany has an entirely separate rate-limit bucket from `api:user:alice` from the United States, while still using the same underlying `RateLimiterService` infrastructure.
 
 ### 3.8 Observability Design
 
@@ -464,6 +827,50 @@ These are scraped by Prometheus via the `/actuator/prometheus` endpoint and can 
 | Metrics | Micrometer + Prometheus | Vendor-neutral metrics facade, standard observability stack |
 | Containerisation | Docker multi-stage build | Small production image (~180MB) with Alpine base and non-root user |
 | Orchestration | Kubernetes (k8s/ manifests) | Standard production deployment, RBAC, ConfigMaps for runtime config |
+
+#### Kubernetes Deployment Topology
+
+The `k8s/` directory contains manifests for a complete Kubernetes deployment:
+
+```
+  ┌────────────────────────────────────────────────────────────────────┐
+  │  Kubernetes Cluster                                                │
+  │                                                                    │
+  │  ┌─────────────────────┐         ┌────────────────────────────┐   │
+  │  │  Ingress Controller  │         │  ConfigMap                  │   │
+  │  │  (nginx/traefik)     ├────────►│  application.properties    │   │
+  │  └─────────┬───────────┘         │  (rate limit defaults)     │   │
+  │            │                     └────────────────────────────┘   │
+  │            ▼                                                       │
+  │  ┌────────────────────────────────────────────────────────────┐   │
+  │  │  Deployment: distributed-rate-limiter   (replicas: 3)      │   │
+  │  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │   │
+  │  │  │   Pod 1       │  │   Pod 2       │  │   Pod 3       │     │   │
+  │  │  │ :8080        │  │ :8080        │  │ :8080        │     │   │
+  │  │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘     │   │
+  │  └─────────┼─────────────────┼─────────────────┼─────────────┘   │
+  │            │                 │                 │                   │
+  │            └─────────────────┴─────────────────┘                  │
+  │                              │ All pods share Redis state         │
+  │                              ▼                                     │
+  │  ┌────────────────────────────────────────────────────────────┐   │
+  │  │  StatefulSet: redis   (replica: 1 + Sentinel for HA)       │   │
+  │  │  PersistentVolumeClaim: 8Gi                                 │   │
+  │  └────────────────────────────────────────────────────────────┘   │
+  │                                                                    │
+  │  ┌───────────────────┐   ┌──────────────────────────────────┐     │
+  │  │  ServiceAccount   │   │  HorizontalPodAutoscaler          │     │
+  │  │  + RBAC Role       │   │  minReplicas: 2, maxReplicas: 10  │     │
+  │  └───────────────────┘   │  CPU target: 70%                  │     │
+  │                           └──────────────────────────────────┘     │
+  │  ┌─────────────────────────────────────────────────────────────┐   │
+  │  │  Prometheus scrapes /actuator/prometheus every 15s          │   │
+  │  │  Grafana dashboards: rate_limit_requests_total, latency P99 │   │
+  │  └─────────────────────────────────────────────────────────────┘   │
+  └────────────────────────────────────────────────────────────────────┘
+```
+
+Because all three rate-limiter pods share the same Redis instance, rate limits are enforced consistently across the cluster — a user hitting pod 1 and pod 2 in alternating requests is still counted against a single shared bucket.
 
 ### 4.2 Token Bucket — Local and Distributed Implementation
 
@@ -524,6 +931,107 @@ return {success, current_tokens, capacity, refill_rate, current_time}
 ```
 
 The Lua script mirrors the Java logic exactly but executes atomically within Redis. The return tuple `{success, current_tokens, capacity, refill_rate, current_time}` is parsed by `RedisRateLimiterBackend` to populate the rate limit check response.
+
+#### Redis Java Client — `RedisTokenBucket.tryConsume()`
+
+`RedisTokenBucket` loads the Lua script from the classpath at construction time using Spring's `ClassPathResource` and invokes it via `RedisTemplate.execute()`. This keeps the Lua script version-controlled alongside the application code:
+
+```java
+// RedisTokenBucket.java (lines 23–64)
+public RedisTokenBucket(String key, int capacity, int refillRate,
+                        RedisTemplate<String, Object> redisTemplate) {
+    this.key = key; this.capacity = capacity; this.refillRate = refillRate;
+    this.redisTemplate = redisTemplate;
+
+    // Script is loaded once at startup — ClassPathResource resolves from src/main/resources
+    DefaultRedisScript<List> script = new DefaultRedisScript<>();
+    script.setLocation(new ClassPathResource("scripts/token-bucket.lua"));
+    script.setResultType(List.class);
+    this.tokenBucketScript = script;
+}
+
+@Override
+public boolean tryConsume(int tokens) {
+    if (tokens <= 0) return false;
+
+    try {
+        long currentTime = System.currentTimeMillis();
+        List<Object> result = redisTemplate.execute(
+            tokenBucketScript,
+            Collections.singletonList(key),   // KEYS[1]
+            capacity, refillRate, tokens, currentTime  // ARGV[1..4]
+        );
+
+        // Lua returns: {success, current_tokens, capacity, refill_rate, last_refill}
+        if (result != null && !result.isEmpty()) {
+            Object successValue = result.get(0);
+            if (successValue instanceof Number) {
+                return ((Number) successValue).intValue() == 1;
+            }
+        }
+        return false;
+
+    } catch (Exception e) {
+        // Propagate so DistributedRateLimiterService can catch and fall back
+        throw new RuntimeException("Redis operation failed", e);
+    }
+}
+```
+
+The `capacity`, `refillRate`, `tokens`, and `currentTime` values are passed as `ARGV` rather than being embedded in the Lua script. This allows the same Lua script to serve any key with any configuration without re-loading the script.
+
+#### In-Memory Sliding Window — `SlidingWindow.java`
+
+The `SlidingWindow` implementation uses a `ConcurrentLinkedDeque<RequestRecord>` to record the timestamp and token cost of each request within the current window:
+
+```java
+// SlidingWindow.java — key data structures and tryConsume
+public class SlidingWindow implements RateLimiter {
+
+    private final int capacity;
+    private final long windowSizeMs = 1000; // fixed 1-second window (see §4.9)
+    private final ConcurrentLinkedDeque<RequestRecord> requests;
+    private final AtomicInteger currentCount;
+
+    private static class RequestRecord {
+        final long timestamp;
+        final int  tokens;
+        RequestRecord(long ts, int t) { timestamp = ts; tokens = t; }
+    }
+
+    public synchronized boolean tryConsume(int tokens) {
+        if (tokens <= 0) return false;
+        long now = System.currentTimeMillis();
+        cleanupExpiredRequests(now);          // evict entries outside [now-1000ms, now]
+
+        if (currentCount.get() + tokens > capacity) return false;
+
+        requests.addLast(new RequestRecord(now, tokens));
+        currentCount.addAndGet(tokens);
+        return true;
+    }
+
+    private void cleanupExpiredRequests(long currentTime) {
+        long windowStart = currentTime - windowSizeMs;
+        // Remove from the front of the deque while the oldest entry is outside the window
+        while (!requests.isEmpty() && requests.peekFirst().timestamp < windowStart) {
+            RequestRecord expired = requests.removeFirst();
+            currentCount.addAndGet(-expired.tokens);   // restore capacity
+        }
+    }
+
+    // getCurrentTokens() returns available capacity (capacity - currentCount)
+    public int getCurrentTokens() {
+        long now = System.currentTimeMillis();
+        synchronized (this) {
+            cleanupExpiredRequests(now);
+            return Math.max(0, capacity - currentCount.get());
+        }
+    }
+}
+```
+
+Unlike Token Bucket, the Sliding Window does **not** refill over time — it evicts stale records. This produces strictly smooth rate enforcement: there is no burst beyond `capacity` requests in any 1-second window regardless of when within the window the requests arrive. The trade-off is O(*k*) memory (one `RequestRecord` per request in the window) vs. O(1) for Token Bucket.
 
 ### 4.3 Fixed Window — Local and Distributed
 
@@ -608,11 +1116,146 @@ score = Σ(weight_i * wouldAllow_i) / Σ(weight_i)
 ```
 If score ≥ 0.50, all components that would allow the request are consumed from. The 50% threshold is configurable in future work.
 
+**`tryConsumeAllMustPass()` — two-phase check-then-consume:**
+
+```java
+// CompositeRateLimiter.java — ALL_MUST_PASS logic (simplified from lines 59–78)
+private boolean tryConsumeAllMustPass(int tokens) {
+    // ── Phase 1: check (read-only, no state mutation) ──────────────────
+    for (LimitComponent component : components) {
+        boolean wouldAllow = component.getRateLimiter().getCurrentTokens() >= tokens;
+        if (!wouldAllow) {
+            // Short-circuit: if any component would deny, skip consume phase entirely.
+            // No tokens are consumed from any component — the state is left unchanged.
+            lastLimitingComponent = component.getName();
+            return false;
+        }
+    }
+
+    // ── Phase 2: consume (state mutating) ──────────────────────────────
+    // Reached only if ALL components passed the check phase.
+    // TOCTOU note: another thread may have consumed tokens between phase 1 and phase 2.
+    for (LimitComponent component : components) {
+        component.getRateLimiter().tryConsume(tokens);
+    }
+    return true;
+}
+```
+
+**`tryConsumeWeightedAverage()` — score-based evaluation:**
+
+```java
+// CompositeRateLimiter.java — WEIGHTED_AVERAGE logic (simplified from lines 95–120)
+private boolean tryConsumeWeightedAverage(int tokens) {
+    double totalWeight = 0.0;
+    double weightedAllowed = 0.0;
+
+    // Evaluate each component and accumulate weighted score
+    for (LimitComponent component : components) {
+        double weight = component.getWeight();            // default: 1.0
+        totalWeight += weight;
+
+        boolean wouldAllow = component.getRateLimiter().getCurrentTokens() >= tokens;
+        if (wouldAllow) {
+            weightedAllowed += weight;
+        }
+    }
+
+    // score = Σ(weight_i * allowed_i) / Σ(weight_i)
+    double score = (totalWeight > 0) ? weightedAllowed / totalWeight : 0.0;
+    boolean allowed = score >= 0.50;   // configurable threshold
+
+    if (allowed) {
+        // Only consume from components that would allow the request
+        for (LimitComponent component : components) {
+            if (component.getRateLimiter().getCurrentTokens() >= tokens) {
+                component.getRateLimiter().tryConsume(tokens);
+            }
+        }
+    }
+    return allowed;
+}
+```
+
+For a two-component composite with weights `api_calls=0.7` and `bandwidth=0.3`, if only `api_calls` allows: score = `(0.7 × 1 + 0.3 × 0) / 1.0 = 0.70 ≥ 0.50` → **allowed**. If only `bandwidth` allows: score = `(0.7 × 0 + 0.3 × 1) / 1.0 = 0.30 < 0.50` → **denied**.
+
 ### 4.6 Fail-Open / Fallback Strategy
 
 `DistributedRateLimiterService` pings Redis before each operation using a lightweight `PING` command. If the ping fails, it falls back to `InMemoryRateLimiterBackend`, which maintains per-key algorithm instances in a `ConcurrentHashMap`. When the next request comes in and Redis is available again, the service automatically switches back to the distributed backend.
 
 **Trade-off:** Checking Redis on every single request adds latency (approximately 0.1–0.5ms for a local Redis). A more sophisticated approach would implement a circuit breaker (Nygard, 2007) with a half-open state, avoiding the ping overhead when Redis is known to be down. This is identified as future work in Chapter 6.
+
+**`DistributedRateLimiterService.isAllowed()` — complete implementation:**
+
+```java
+// DistributedRateLimiterService.java (lines 44–86)
+// @Primary ensures Spring injects this over RateLimiterService when Redis is enabled.
+// @ConditionalOnProperty allows it to be disabled for pure in-memory mode.
+
+private volatile boolean usingFallback = false;
+
+public boolean isAllowed(String key, int tokens) {
+    if (tokens <= 0) return false;
+
+    // 1. Resolve the effective config for this key (schedule > exact > pattern > default)
+    RateLimitConfig config = configurationResolver.resolveConfig(key);
+
+    // 2. Determine which backend to use (Redis or in-memory fallback)
+    RateLimiterBackend backend = getAvailableBackend();
+
+    try {
+        // 3. Get or create the rate limiter instance for this key
+        RateLimiter rateLimiter = backend.getRateLimiter(key, config);
+        // 4. Attempt to consume tokens — atomic in Redis via Lua, synchronized in-memory
+        return rateLimiter.tryConsume(tokens);
+
+    } catch (RuntimeException ex) {
+        // 5. If Redis throws (e.g. connection reset), fall back to in-memory immediately
+        if (backend != fallbackBackend) {
+            usingFallback = true;
+            try {
+                RateLimiter fallbackLimiter = fallbackBackend.getRateLimiter(key, config);
+                return fallbackLimiter.tryConsume(tokens);
+            } catch (RuntimeException fallbackEx) {
+                return false;   // Both backends failed — deny the request (fail-closed)
+            }
+        }
+        return false;
+    }
+}
+
+private RateLimiterBackend getAvailableBackend() {
+    if (primaryBackend.isAvailable()) {   // pings Redis via PING command
+        if (usingFallback) {
+            usingFallback = false;        // Redis recovered — silently switch back
+        }
+        return primaryBackend;
+    } else {
+        usingFallback = true;
+        return fallbackBackend;           // degrade to in-memory, fail-open
+    }
+}
+```
+
+**Three operational states:**
+
+```
+State 1: Normal (Redis healthy)
+  isAllowed() → getAvailableBackend() returns RedisRateLimiterBackend
+              → RedisTokenBucket.tryConsume() → Lua script executed atomically
+              → Consistent limits enforced across all instances
+
+State 2: Degraded (Redis unreachable)
+  isAllowed() → getAvailableBackend() returns InMemoryRateLimiterBackend
+              → TokenBucket.tryConsume() → synchronized Java call, local only
+              → Each pod enforces limits independently (limits effectively multiplied
+                by the number of pods — fail-open trade-off)
+
+State 3: Recovery (Redis becomes reachable again)
+  Next request: getAvailableBackend() sees primaryBackend.isAvailable() = true
+              → usingFallback = false → automatic switch back to Redis
+              → No manual intervention or restart required
+```
 
 ### 4.7 Configuration and Runtime Updates
 
@@ -630,6 +1273,79 @@ If score ≥ 0.50, all components that would allow the request are consumed from
 
 Every write operation calls `configurationResolver.clearCache()` to ensure subsequent checks pick up the new configuration.
 
+**`ConfigurationResolver.resolveConfig()` — full resolution chain with caching:**
+
+```java
+// ConfigurationResolver.java — simplified resolution logic
+// ConcurrentHashMap for thread-safe reads; cleared on every config write
+private final ConcurrentHashMap<String, RateLimitConfig> configCache = new ConcurrentHashMap<>();
+
+public RateLimitConfig resolveConfig(String key) {
+    // Cache lookup — avoids regex evaluation on every request for known keys
+    RateLimitConfig cached = configCache.get(key);
+    if (cached != null) return cached;
+
+    RateLimitConfig result = resolveConfigUncached(key);
+    configCache.put(key, result);       // cache for future requests to the same key
+    return result;
+}
+
+private RateLimitConfig resolveConfigUncached(String key) {
+    // Priority 1: Scheduled time-based override (highest priority)
+    if (scheduleManagerService != null) {
+        RateLimitConfig scheduled = scheduleManagerService.getActiveConfig(key);
+        if (scheduled != null) return scheduled;
+    }
+
+    // Priority 2: Exact key match
+    RateLimitConfig perKeyConfig = configuration.getKeys().get(key);
+    if (perKeyConfig != null) return perKeyConfig;
+
+    // Priority 3: First matching wildcard pattern
+    for (Map.Entry<String, RateLimitConfig> entry : configuration.getPatterns().entrySet()) {
+        if (matchesPattern(key, entry.getKey())) {
+            return entry.getValue();
+        }
+    }
+
+    // Priority 4: Global default
+    return new RateLimitConfig(
+        configuration.getCapacity(),        // ratelimiter.capacity (default: 10)
+        configuration.getRefillRate(),      // ratelimiter.refillRate (default: 2)
+        configuration.getCleanupIntervalMs(),
+        RateLimitAlgorithm.TOKEN_BUCKET
+    );
+}
+
+public void clearCache() {
+    configCache.clear();   // called by RateLimitConfigController on every write
+}
+```
+
+**Configuration update sequence (runtime, no restart):**
+
+```
+Operator sends:
+  POST /api/ratelimit/config/keys/premium_user
+  Body: {"capacity":100,"refillRate":20}
+           │
+           ▼
+  RateLimitConfigController.updateKeyConfig()
+           │
+           ├─► configuration.getKeys().put("premium_user", new RateLimitConfig(100,20,...))
+           │
+           └─► configurationResolver.clearCache()   ← invalidates the entire cache
+                                                       (all keys, not just premium_user)
+  Next request for key="premium_user":
+           │
+           ▼
+  configCache.get("premium_user") = null  (cache miss after clear)
+  resolveConfigUncached("premium_user")
+  → exact key match found → RateLimitConfig(capacity=100, refillRate=20)
+  → cached for subsequent requests
+  → applied immediately, no restart
+```
+
 ### 4.8 Security Layer
 
 **`SecurityFilter`** (registered with `FilterConfiguration`) enforces:
@@ -640,7 +1356,117 @@ Every write operation calls `configurationResolver.clearCache()` to ensure subse
 
 **`IpSecurityService`** maintains configurable IP whitelist and blacklist. `IpAddressExtractor` correctly handles proxy chains by parsing the `X-Forwarded-For` header and taking the first (left-most) non-private IP address, preventing IP spoofing via header injection from within the proxy chain.
 
-### 4.9 Known Implementation Gaps
+**`SecurityFilter.doFilter()` — enforces size limits and injects security headers:**
+
+```java
+// SecurityFilter.java — HTTP security controls (simplified)
+@Override
+public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
+        throws IOException, ServletException {
+
+    HttpServletRequest  httpRequest  = (HttpServletRequest)  request;
+    HttpServletResponse httpResponse = (HttpServletResponse) response;
+
+    // ── 1. Add OWASP security response headers ─────────────────────────────
+    if (securityHeadersEnabled) {
+        httpResponse.setHeader("X-Content-Type-Options",  "nosniff");
+        httpResponse.setHeader("X-Frame-Options",         "DENY");
+        httpResponse.setHeader("X-XSS-Protection",        "0");   // disabled: use CSP instead
+        httpResponse.setHeader("Strict-Transport-Security","max-age=31536000; includeSubDomains");
+        httpResponse.setHeader("Content-Security-Policy", "default-src 'none'");
+        httpResponse.setHeader("Cache-Control",           "no-store");
+    }
+
+    // ── 2. Enforce maximum request body size (default: 1MB) ────────────────
+    String contentLengthHeader = httpRequest.getHeader("Content-Length");
+    if (contentLengthHeader != null) {
+        long contentLength = Long.parseLong(contentLengthHeader);
+        if (contentLength > maxRequestSizeBytes) {
+            httpResponse.setStatus(HttpServletResponse.SC_REQUEST_ENTITY_TOO_LARGE); // 413
+            return;
+        }
+    }
+
+    chain.doFilter(request, response);   // proceed to next filter/controller
+}
+```
+
+**`IpAddressExtractor` — proxy-aware IP extraction:**
+
+```java
+// IpAddressExtractor.java (simplified) — prevents spoofing via crafted XFF headers
+public String getClientIpAddress(HttpServletRequest request) {
+    String xForwardedFor = request.getHeader("X-Forwarded-For");
+    if (xForwardedFor != null && !xForwardedFor.isBlank()) {
+        // XFF format: "client, proxy1, proxy2" — take the leftmost (originating) IP
+        String[] ips = xForwardedFor.split(",");
+        for (String ip : ips) {
+            String trimmed = ip.trim();
+            // Skip private/loopback addresses injected by internal proxies
+            if (!isPrivateAddress(trimmed)) {
+                return trimmed;
+            }
+        }
+    }
+    return request.getRemoteAddr();   // fallback: direct connection IP
+}
+
+private boolean isPrivateAddress(String ip) {
+    return ip.startsWith("10.")   || ip.startsWith("172.16.")
+        || ip.startsWith("192.168.") || ip.equals("127.0.0.1")
+        || ip.equals("::1")         || ip.equals("0:0:0:0:0:0:0:1");
+}
+```
+
+### 4.9 Service Layer — `RateLimiterService` Orchestration
+
+`RateLimiterService` is the primary entry point for all standard (non-composite, non-geographic) rate limit checks. It delegates to `DistributedRateLimiterService` and also applies Micrometer metrics recording and SLF4J MDC enrichment:
+
+```java
+// RateLimiterService.java — isAllowed() with metrics and structured logging
+public boolean isAllowed(String key, int tokens) {
+    long startNanos = System.nanoTime();
+    boolean allowed;
+
+    try {
+        allowed = distributedRateLimiterService.isAllowed(key, tokens);
+    } finally {
+        // Record per-request latency histogram regardless of outcome
+        long durationNanos = System.nanoTime() - startNanos;
+        metricsService.recordRequestDuration(durationNanos);
+    }
+
+    // Emit counters for Prometheus (tagged by key and result)
+    if (allowed) {
+        metricsService.recordAllowedRequest(key);
+    } else {
+        metricsService.recordDeniedRequest(key);
+
+        // Enrich log context so that all deny-related log lines in this request
+        // carry key and reason — visible in Elasticsearch after MDC extraction
+        MDC.put("rateLimitKey",    key);
+        MDC.put("rateLimitResult", "DENIED");
+        logger.warn("Rate limit exceeded for key: {}, tokens requested: {}", key, tokens);
+        MDC.remove("rateLimitKey");
+        MDC.remove("rateLimitResult");
+    }
+    return allowed;
+}
+```
+
+**Prometheus metrics** emitted by `MetricsService`:
+
+```
+rate_limit_requests_total{key="user:alice", result="allowed"} 1047
+rate_limit_requests_total{key="user:alice", result="denied"}    93
+rate_limit_processing_duration_seconds{quantile="0.99"}        0.0032
+rate_limit_bucket_creations_total                              1250
+rate_limit_redis_errors_total                                     0
+```
+
+These counters allow the Grafana dashboard (in `k8s/monitoring/`) to plot per-key allow/deny ratios, P99 latency over time, and Redis error rate — providing real-time operational visibility.
+
+### 4.10 Known Implementation Gaps
 
 The following limitations are acknowledged honestly:
 
@@ -722,6 +1548,65 @@ Key integration tests:
 4. After all threads complete, asserts that exactly 100 requests were allowed (no over-counting).
 
 This test catches the race condition described in Section 2.4.1. It is run against both the in-memory backend and the Redis backend (via Testcontainers).
+
+**`ConcurrentPerformanceTest` — key excerpt:**
+
+```java
+// ConcurrentPerformanceTest.java (lines 23–80)
+// @SpringBootTest + @Testcontainers spins up a real Redis container
+// before the application context is created.
+
+@Container
+@ServiceConnection
+static GenericContainer<?> redis = new GenericContainer<>("redis:7.4.1-alpine")
+        .withExposedPorts(6379);
+
+@Test
+void testServiceDirectCallPerformance() throws InterruptedException {
+    final int THREAD_COUNT       = 10;
+    final int REQUESTS_PER_THREAD = 100;  // total = 1,000 requests across 10 threads
+
+    ExecutorService executor     = Executors.newFixedThreadPool(THREAD_COUNT);
+    CountDownLatch  latch        = new CountDownLatch(THREAD_COUNT);
+    AtomicLong      totalReqs    = new AtomicLong(0);
+    AtomicLong      allowedReqs  = new AtomicLong(0);
+
+    long startTime = System.nanoTime();
+
+    for (int i = 0; i < THREAD_COUNT; i++) {
+        final int threadId = i;
+        executor.submit(() -> {
+            try {
+                for (int j = 0; j < REQUESTS_PER_THREAD; j++) {
+                    String key = "direct_perf_" + threadId; // one key per thread
+                    boolean allowed = rateLimiterService.isAllowed(key, 1);
+
+                    totalReqs.incrementAndGet();
+                    if (allowed) allowedReqs.incrementAndGet();
+                }
+            } finally {
+                latch.countDown();   // signal that this thread is done
+            }
+        });
+    }
+
+    boolean completed = latch.await(60, TimeUnit.SECONDS);
+    assertTrue(completed, "Test did not complete within 60 seconds");
+
+    long durationNanos = System.nanoTime() - startTime;
+    double durationSec = durationNanos / 1_000_000_000.0;
+
+    assertEquals(THREAD_COUNT * REQUESTS_PER_THREAD, totalReqs.get(),
+                 "All 1,000 requests must be accounted for");
+    assertTrue(allowedReqs.get() > 0, "At least some requests must be allowed");
+
+    double throughput = totalReqs.get() / durationSec;
+    System.out.printf("Throughput: %.0f req/s%n", throughput);
+    // Expected: >1,000 req/s with Redis; >10,000 req/s with in-memory
+}
+```
+
+The test uses a `CountDownLatch` to ensure all 10 threads attempt their first request as simultaneously as possible. The per-thread key strategy (`"direct_perf_" + threadId`) means each thread has its own bucket — this tests throughput and absence of lock contention rather than correctness. The correctness variant (`BurstHandlingComparisonTest`) uses a single shared key with capacity 100 and 200 concurrent threads to verify that exactly 100 are allowed and 100 are denied.
 
 **`BurstHandlingComparisonTest`** sends a burst of 50 requests to the same key simultaneously with each of the four single algorithms, comparing the allowed counts. Expected outcomes:
 - Token Bucket: 10 allowed (capacity=10), 40 denied.
