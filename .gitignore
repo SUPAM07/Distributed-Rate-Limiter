@@ -6,3 +6,4 @@ coverage/
 context/
 rules.md
 .DS_Store
+*.log
