@@ -20,6 +20,16 @@ function parsePositiveInt(key: string, raw: string): number {
   return n;
 }
 
+export type AlgorithmType = 'token-bucket' | 'fixed-window' | 'sliding-window-log' | 'sliding-window-counter';
+
+function parseAlgorithm(key: string, raw: string): AlgorithmType {
+  const allowed = ['token-bucket', 'fixed-window', 'sliding-window-log', 'sliding-window-counter'];
+  if (!allowed.includes(raw)) {
+    throw new Error(`Environment variable ${key} must be one of: ${allowed.join(', ')}, got: "${raw}"`);
+  }
+  return raw as AlgorithmType;
+}
+
 export const config = {
   port: parsePositiveInt('PORT', optionalEnv('PORT', '3000')),
 
@@ -30,6 +40,27 @@ export const config = {
   },
 
   rateLimit: {
+    /**
+     * Rate limiting algorithm to use.
+     */
+    algorithm: parseAlgorithm(
+      'RATE_LIMIT_ALGORITHM',
+      optionalEnv('RATE_LIMIT_ALGORITHM', 'token-bucket'),
+    ),
+    /**
+     * Window duration in seconds (for fixed-window, sliding-window-log, sliding-window-counter).
+     */
+    windowSeconds: parsePositiveInt(
+      'RATE_LIMIT_WINDOW_SECONDS',
+      optionalEnv('RATE_LIMIT_WINDOW_SECONDS', '60'),
+    ),
+    /**
+     * Maximum number of requests per window (for fixed-window, sliding-window-log, sliding-window-counter).
+     */
+    limit: parsePositiveInt(
+      'RATE_LIMIT_LIMIT',
+      optionalEnv('RATE_LIMIT_LIMIT', '10'),
+    ),
     /**
      * Maximum number of tokens in the bucket (= max burst capacity).
      */
