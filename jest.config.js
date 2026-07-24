@@ -2,10 +2,16 @@
 module.exports = {
   preset: 'ts-jest',
   testEnvironment: 'node',
+
   roots: ['<rootDir>/tests'],
   testMatch: ['**/*.test.ts'],
   moduleFileExtensions: ['ts', 'js', 'json'],
-  // Allow refill-over-time tests to complete.
+
+  // Register shared test lifecycle hooks.
+  setupFilesAfterEnv: ['<rootDir>/tests/setup.ts'],
+
+  // Allow refill/window-expiry tests to complete.
   testTimeout: 30000,
+
   verbose: true,
 };
