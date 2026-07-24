@@ -32,7 +32,7 @@ import { closeRedisClient } from '../src/redis/client';
 const RUN_ID = `test-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
 function testKey(label: string): string {
-  return buildRateLimitKey(`${RUN_ID}-${label}`);
+  return buildRateLimitKey('token-bucket', `${RUN_ID}-${label}`);
 }
 
 /** Flush a specific Redis key before use. */
