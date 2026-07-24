@@ -9,13 +9,6 @@ function testKey(label: string): string {
   return buildRateLimitKey('fixed-window', `${RUN_ID}-${label}`);
 }
 
-async function flushKeys(redis: Redis, pattern: string): Promise<void> {
-  const keys = await redis.keys(pattern);
-  if (keys.length > 0) {
-    await redis.del(...keys);
-  }
-}
-
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -36,80 +29,99 @@ afterAll(async () => {
   await closeRedisClient();
 });
 
-describe('FixedWindow — within limit', () => {
-  const LIMIT = 5;
-  const limiter = new FixedWindow({ limit: LIMIT, windowSeconds: 60, ttlSeconds: 120 });
-
-  it('allows LIMIT requests and decrements remaining correctly', async () => {
+describe('FixedWindow', () => {
+  it('allows exactly LIMIT requests and reports remaining correctly', async () => {
+    const LIMIT = 5;
+    const limiter = new FixedWindow({ limit: LIMIT, windowSeconds: 60, ttlSeconds: 120 });
     const key = testKey('within-limit');
+
     for (let i = 0; i < LIMIT; i++) {
       const result = await limiter.consume(key);
+
       expect(result.allowed).toBe(true);
       expect(result.remaining).toBe(LIMIT - 1 - i);
+      expect(result.remaining).toBeGreaterThanOrEqual(0);
+      expect(result.remaining).toBeLessThanOrEqual(LIMIT);
+      expect(result.resetAtMs).toBeGreaterThan(Date.now());
     }
+
+    const rejected = await limiter.consume(key);
+    expect(rejected.allowed).toBe(false);
+    expect(rejected.remaining).toBe(0);
+    expect(rejected.retryAfterMs).toBeGreaterThan(0);
   });
-});
 
-describe('FixedWindow — exhaustion and reset', () => {
-  const LIMIT = 2;
-  const WINDOW = 2; // 2 seconds to avoid jitter at exact second boundaries
-  const limiter = new FixedWindow({ limit: LIMIT, windowSeconds: WINDOW, ttlSeconds: 10 });
+  it('uses the same reset boundary within one fixed window', async () => {
+    const limiter = new FixedWindow({ limit: 5, windowSeconds: 60, ttlSeconds: 120 });
+    const key = testKey('stable-reset');
 
-  it('rejects requests over limit and resets after window', async () => {
-    const key = testKey('exhaustion');
-    
-    // Exhaust the window
+    const first = await limiter.consume(key);
+    const second = await limiter.consume(key);
+
+    expect(first.resetAtMs).toBe(second.resetAtMs);
+  });
+
+  it('resets after the fixed window boundary', async () => {
+    const LIMIT = 2;
+    const WINDOW = 2;
+    const limiter = new FixedWindow({ limit: LIMIT, windowSeconds: WINDOW, ttlSeconds: 10 });
+    const key = testKey('reset');
+
     await limiter.consume(key);
     const lastAllowed = await limiter.consume(key);
-    expect(lastAllowed.allowed).toBe(true);
-    
     const rejected = await limiter.consume(key);
+
     expect(rejected.allowed).toBe(false);
     expect(rejected.remaining).toBe(0);
     expect(rejected.retryAfterMs).toBeGreaterThan(0);
     expect(rejected.retryAfterMs).toBeLessThanOrEqual(WINDOW * 1000);
 
-    // Wait until the next window
-    const now = Date.now();
-    const timeToNextWindow = lastAllowed.resetAtMs - now;
-    await sleep(timeToNextWindow + 50); // slight buffer
-    
+    await sleep(Math.max(0, lastAllowed.resetAtMs - Date.now()) + 75);
+
     const reset = await limiter.consume(key);
     expect(reset.allowed).toBe(true);
     expect(reset.remaining).toBe(LIMIT - 1);
+    expect(reset.resetAtMs).toBeGreaterThan(lastAllowed.resetAtMs);
   });
-});
 
-describe('FixedWindow — concurrency', () => {
-  const LIMIT = 10;
-  const limiter = new FixedWindow({ limit: LIMIT, windowSeconds: 60, ttlSeconds: 120 });
-
-  it('parallel consume() calls never allow more than LIMIT requests', async () => {
+  it('parallel consume calls never admit more than LIMIT', async () => {
+    const LIMIT = 10;
+    const limiter = new FixedWindow({ limit: LIMIT, windowSeconds: 60, ttlSeconds: 120 });
     const key = testKey('concurrency');
+
     const results = await Promise.all(
       Array.from({ length: LIMIT * 2 }, () => limiter.consume(key)),
     );
 
-    const allowed = results.filter((r) => r.allowed).length;
-    const rejected = results.filter((r) => !r.allowed).length;
-
-    expect(allowed).toBe(LIMIT);
-    expect(rejected).toBe(LIMIT);
+    expect(results.filter((r) => r.allowed)).toHaveLength(LIMIT);
+    expect(results.filter((r) => !r.allowed)).toHaveLength(LIMIT);
   });
-});
 
-describe('FixedWindow — TTL', () => {
-  const limiter = new FixedWindow({ limit: 5, windowSeconds: 2, ttlSeconds: 10 });
-
-  it('sets a TTL on the Redis key', async () => {
+  it('sets TTL on the concrete Redis window key', async () => {
+    const TTL = 10;
+    const WINDOW_MS = 2000;
+    const limiter = new FixedWindow({ limit: 5, windowSeconds: 2, ttlSeconds: TTL });
     const key = testKey('ttl');
+
+    const before = Date.now();
     await limiter.consume(key);
+    const after = Date.now();
 
-    const windowStartMs = Math.floor(Date.now() / 2000) * 2000;
-    const actualKey = `${key}:${windowStartMs}`;
+    const possibleWindowStarts = new Set([
+      Math.floor(before / WINDOW_MS) * WINDOW_MS,
+      Math.floor(after / WINDOW_MS) * WINDOW_MS,
+    ]);
 
-    const ttl = await testRedis.ttl(actualKey);
+    let ttl = -2;
+    for (const start of possibleWindowStarts) {
+      const candidate = await testRedis.ttl(`${key}:${start}`);
+      if (candidate > 0) {
+        ttl = candidate;
+        break;
+      }
+    }
+
     expect(ttl).toBeGreaterThan(0);
-    expect(ttl).toBeLessThanOrEqual(10);
+    expect(ttl).toBeLessThanOrEqual(TTL);
   });
 });

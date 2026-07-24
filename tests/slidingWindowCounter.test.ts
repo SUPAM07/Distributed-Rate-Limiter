@@ -13,12 +13,22 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function waitForWindowOffset(windowMs: number, targetOffsetMs: number): Promise<void> {
+  while (true) {
+    const offset = Date.now() % windowMs;
+    if (offset >= targetOffsetMs && offset < targetOffsetMs + 100) return;
+    await sleep(20);
+  }
+}
+
 let testRedis: Redis;
 
 beforeAll(() => {
   testRedis = new Redis({
     host: process.env['REDIS_HOST'] ?? 'localhost',
     port: parseInt(process.env['REDIS_PORT'] ?? '6379', 10),
+    password: process.env['REDIS_PASSWORD'] || undefined,
+    maxRetriesPerRequest: 3,
   });
 });
 
@@ -27,75 +37,86 @@ afterAll(async () => {
   await closeRedisClient();
 });
 
-describe('SlidingWindowCounter — within limit', () => {
-  const LIMIT = 5;
-  const limiter = new SlidingWindowCounter({ limit: LIMIT, windowSeconds: 60, ttlSeconds: 120 });
-
-  it('allows LIMIT requests', async () => {
+describe('SlidingWindowCounter', () => {
+  it('allows LIMIT requests and rejects the next request', async () => {
+    const LIMIT = 5;
+    const limiter = new SlidingWindowCounter({ limit: LIMIT, windowSeconds: 60, ttlSeconds: 120 });
     const key = testKey('within-limit');
+
+    for (let i = 0; i < LIMIT; i++) {
+      const result = await limiter.consume(key);
+      expect(result.allowed).toBe(true);
+      expect(result.remaining).toBeGreaterThanOrEqual(0);
+      expect(result.remaining).toBeLessThanOrEqual(LIMIT - 1);
+      expect(result.resetAtMs).toBeGreaterThan(Date.now());
+    }
+
+    const rejected = await limiter.consume(key);
+    expect(rejected.allowed).toBe(false);
+    expect(rejected.remaining).toBe(0);
+    expect(rejected.retryAfterMs).toBeGreaterThan(0);
+  });
+
+  it('carries previous-window traffic into the next window with decaying weight', async () => {
+    const LIMIT = 5;
+    const WINDOW_SECONDS = 4;
+    const WINDOW_MS = WINDOW_SECONDS * 1000;
+    const limiter = new SlidingWindowCounter({
+      limit: LIMIT,
+      windowSeconds: WINDOW_SECONDS,
+      ttlSeconds: 20,
+    });
+    const key = testKey('weighted-boundary');
+
+    // Put five requests late in one window so they should still have high weight
+    // immediately after the next boundary.
+    await waitForWindowOffset(WINDOW_MS, 3000);
+
     for (let i = 0; i < LIMIT; i++) {
       const result = await limiter.consume(key);
       expect(result.allowed).toBe(true);
     }
-  });
-});
 
-describe('SlidingWindowCounter — weighted estimation', () => {
-  const LIMIT = 10;
-  const WINDOW = 2; // 2 seconds
-  const limiter = new SlidingWindowCounter({ limit: LIMIT, windowSeconds: WINDOW, ttlSeconds: 10 });
+    const currentOffset = Date.now() % WINDOW_MS;
+    await sleep(WINDOW_MS - currentOffset + 250);
 
-  it('estimates count accurately across boundaries', async () => {
-    const key = testKey('estimation');
-    
-    // 1. Fill the previous window completely
-    const startMs = Date.now();
-    const currWindowStartMs = Math.floor(startMs / (WINDOW * 1000)) * (WINDOW * 1000);
-    const msUntilNextWindow = currWindowStartMs + (WINDOW * 1000) - startMs;
-    
-    for (let i = 0; i < LIMIT; i++) {
-      await limiter.consume(key);
-    }
-    
-    // 2. Wait until we cross into the next window, plus 25% of it
-    // Wait out the rest of the current window, plus 25% of the next window (500ms)
-    await sleep(msUntilNextWindow + 500);
-    
-    // 3. At 25% into the window, weight = 0.75. Estimated previous count = 10 * 0.75 = 7.5
-    // Limit is 10, so we should have ~2.5 tokens left (rounded down to 2 in terms of allows)
-    // We expect exactly 2 requests to be allowed.
-    const r1 = await limiter.consume(key);
-    const r2 = await limiter.consume(key);
-    const r3 = await limiter.consume(key);
-    
-    expect(r1.allowed).toBe(true);
-    expect(r2.allowed).toBe(true);
-    // Might be false or true depending on exact timing (sleep jitter), but likely false if estimated > 10
-    // We will just verify the first one works and it eventually blocks.
-    
-    // Let's exhaust it completely
-    let allowedCount = 2; // r1 and r2
-    if (r3.allowed) allowedCount++;
-    
-    const r4 = await limiter.consume(key);
-    if (r4.allowed) allowedCount++;
-    
-    // Total allowed in this window should be strictly less than 10 because previous window weighs heavily
-    expect(allowedCount).toBeLessThan(LIMIT);
-  });
-});
+    const firstInNextWindow = await limiter.consume(key);
 
-describe('SlidingWindowCounter — concurrency', () => {
-  const LIMIT = 20;
-  const limiter = new SlidingWindowCounter({ limit: LIMIT, windowSeconds: 60, ttlSeconds: 120 });
+    // A fixed-window implementation would reset to remaining=4 here.
+    // A sliding counter must retain substantial previous-window usage.
+    expect(firstInNextWindow.remaining).toBeLessThan(LIMIT - 1);
 
-  it('parallel consume calls never exceed limits', async () => {
+    // It must reach rejection before another full LIMIT requests can be admitted.
+    const followUps = await Promise.all(
+      Array.from({ length: LIMIT }, () => limiter.consume(key)),
+    );
+    expect(followUps.some((r) => !r.allowed)).toBe(true);
+  }, 10_000);
+
+  it('parallel consume calls never admit more than LIMIT', async () => {
+    const LIMIT = 20;
+    const limiter = new SlidingWindowCounter({ limit: LIMIT, windowSeconds: 60, ttlSeconds: 120 });
     const key = testKey('concurrency');
+
     const results = await Promise.all(
       Array.from({ length: LIMIT * 2 }, () => limiter.consume(key)),
     );
 
-    const allowed = results.filter((r) => r.allowed).length;
-    expect(allowed).toBe(LIMIT);
+    expect(results.filter((r) => r.allowed)).toHaveLength(LIMIT);
+    expect(results.filter((r) => !r.allowed)).toHaveLength(LIMIT);
+  });
+
+  it('stores counter state in Redis with TTL', async () => {
+    const TTL = 10;
+    const limiter = new SlidingWindowCounter({ limit: 5, windowSeconds: 2, ttlSeconds: TTL });
+    const key = testKey('redis-state');
+
+    await limiter.consume(key);
+
+    expect(await testRedis.exists(key)).toBe(1);
+
+    const ttl = await testRedis.ttl(key);
+    expect(ttl).toBeGreaterThan(0);
+    expect(ttl).toBeLessThanOrEqual(TTL);
   });
 });
