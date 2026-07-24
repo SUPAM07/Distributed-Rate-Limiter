@@ -1,5 +1,5 @@
 import type { Request, Response, NextFunction } from 'express';
-import { TokenBucket } from '../limiter/algorithms/tokenBucket';
+import { createRateLimiter } from '../limiter/createRateLimiter';
 import { buildRateLimitKey } from '../redis/keys';
 import { config } from '../config/env';
 
@@ -7,11 +7,7 @@ import { config } from '../config/env';
 // Singleton limiter instance shared across all requests.
 // ---------------------------------------------------------------------------
 
-const limiter = new TokenBucket({
-  capacity: config.rateLimit.capacity,
-  refillRate: config.rateLimit.refillRate,
-  ttlSeconds: config.rateLimit.ttlSeconds,
-});
+const limiter = createRateLimiter();
 
 // ---------------------------------------------------------------------------
 // Key resolution
@@ -39,7 +35,7 @@ export async function rateLimitMiddleware(
 
   try {
     const identifier = resolveIdentifier(req);
-    const key = buildRateLimitKey(identifier);
+    const key = buildRateLimitKey(config.rateLimit.algorithm, identifier);
     result = await limiter.consume(key);
   } catch (err: unknown) {
     // Architecture rule 8: infrastructure failures must be distinguishable from rate-limit rejection.
@@ -60,7 +56,7 @@ export async function rateLimitMiddleware(
   }
 
   // Set standard rate-limit headers on every response.
-  res.setHeader('X-RateLimit-Limit', config.rateLimit.capacity);
+  res.setHeader('X-RateLimit-Limit', config.rateLimit.algorithm === 'token-bucket' ? config.rateLimit.capacity : config.rateLimit.limit);
   res.setHeader('X-RateLimit-Remaining', result.remaining);
   res.setHeader(
     'X-RateLimit-Reset',
