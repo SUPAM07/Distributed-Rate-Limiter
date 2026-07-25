@@ -33,10 +33,11 @@ export interface RateLimiterResult {
  */
 export interface RateLimiter {
   /**
-   * Attempt to consume one unit of capacity for the given key.
+   * Consume tokens/capacity for a given request.
    *
-   * @param key - A namespaced Redis key identifying the rate-limit bucket.
-   * @returns     RateLimiterResult describing the outcome.
+   * @param key - The unique Redis key for this bucket/window, or an array of keys for hierarchical/composite limiters.
+   * @param weight - Optional weight (cost) of the request. Defaults to 1.
+   * @returns A promise resolving to the rate-limit result.
    */
-  consume(key: string): Promise<RateLimiterResult>;
+  consume(key: string | string[], weight?: number): Promise<RateLimiterResult>;
 }
