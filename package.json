@@ -8,7 +8,9 @@
     "build": "tsc",
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
-    "test": "jest --runInBand"
+    "test": "jest --runInBand",
+    "test:coverage": "jest --runInBand --coverage",
+    "benchmark": "ts-node benchmarks/benchmarkRunner.ts"
   },
   "keywords": ["rate-limiter", "redis", "token-bucket", "distributed"],
   "author": "",
