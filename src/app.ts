@@ -23,3 +23,4 @@ app.use((_req, res) => {
 });
 
 export default app;
+export { app };
