@@ -14,4 +14,20 @@ module.exports = {
   testTimeout: 30000,
 
   verbose: true,
+
+  // Coverage configuration
+  collectCoverageFrom: [
+    'src/**/*.ts',
+    // server.ts is an entry-point and cannot be unit-tested without spawning a process
+    '!src/server.ts',
+  ],
+  coverageThreshold: {
+    global: {
+      statements: 80,
+      functions: 80,
+      lines: 80,
+      branches: 75,
+    },
+  },
+  coverageReporters: ['text', 'lcov', 'html'],
 };
