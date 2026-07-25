@@ -20,10 +20,10 @@ function parsePositiveInt(key: string, raw: string): number {
   return n;
 }
 
-export type AlgorithmType = 'token-bucket' | 'fixed-window' | 'sliding-window-log' | 'sliding-window-counter';
+export type AlgorithmType = 'token-bucket' | 'fixed-window' | 'sliding-window-log' | 'sliding-window-counter' | 'leaky-bucket' | 'gcra';
 
 function parseAlgorithm(key: string, raw: string): AlgorithmType {
-  const allowed = ['token-bucket', 'fixed-window', 'sliding-window-log', 'sliding-window-counter'];
+  const allowed = ['token-bucket', 'fixed-window', 'sliding-window-log', 'sliding-window-counter', 'leaky-bucket', 'gcra'];
   if (!allowed.includes(raw)) {
     throw new Error(`Environment variable ${key} must be one of: ${allowed.join(', ')}, got: "${raw}"`);
   }
@@ -69,18 +69,40 @@ export const config = {
       optionalEnv('RATE_LIMIT_CAPACITY', '10'),
     ),
     /**
-     * Tokens refilled per second.
+     * Number of tokens refilled per second.
      */
     refillRate: parsePositiveInt(
       'RATE_LIMIT_REFILL_RATE',
       optionalEnv('RATE_LIMIT_REFILL_RATE', '1'),
     ),
     /**
-     * Redis key TTL in seconds. Inactive keys expire after this duration.
+     * TTL for the Redis key.
      */
     ttlSeconds: parsePositiveInt(
       'RATE_LIMIT_TTL_SECONDS',
       optionalEnv('RATE_LIMIT_TTL_SECONDS', '3600'),
     ),
+
+    leakyBucket: {
+      capacity: parsePositiveInt(
+        'LEAKY_BUCKET_CAPACITY',
+        optionalEnv('LEAKY_BUCKET_CAPACITY', '10'),
+      ),
+      leakRate: parsePositiveInt(
+        'LEAKY_BUCKET_LEAK_RATE',
+        optionalEnv('LEAKY_BUCKET_LEAK_RATE', '1'),
+      ),
+    },
+
+    gcra: {
+      emissionIntervalMs: parsePositiveInt(
+        'GCRA_EMISSION_INTERVAL',
+        optionalEnv('GCRA_EMISSION_INTERVAL', '100'), // 100ms per request (10 req/s)
+      ),
+      burstCapacity: parsePositiveInt(
+        'GCRA_BURST_CAPACITY',
+        optionalEnv('GCRA_BURST_CAPACITY', '10'),
+      ),
+    },
   },
 } as const;
