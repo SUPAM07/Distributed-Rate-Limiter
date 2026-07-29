@@ -1,4 +1,4 @@
-import { buildRateLimitKey } from '../src/redis/keys';
+import { buildRateLimitKey } from '../../src/redis/keys';
 
 describe('buildRateLimitKey', () => {
   it('namespaces identical identifiers by algorithm', () => {
