@@ -1,9 +1,9 @@
 import supertest from 'supertest';
 import Redis from 'ioredis';
-import app from '../src/app';
-import { buildRateLimitKey } from '../src/redis/keys';
-import { TokenBucket } from '../src/limiter/algorithms/tokenBucket';
-import { closeRedisClient } from '../src/redis/client';
+import app from '../../src/app';
+import { buildRateLimitKey } from '../../src/redis/keys';
+import { TokenBucket } from '../../src/limiter/algorithms/tokenBucket';
+import { closeRedisClient } from '../../src/redis/client';
 
 const RUN_ID = `test-tb-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
