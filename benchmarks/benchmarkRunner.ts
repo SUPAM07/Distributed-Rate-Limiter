@@ -51,7 +51,11 @@ const SCENARIOS = [
   { name: 'gcra',                  factory: () => new GCRA({ emissionIntervalMs: 1, burstCapacity: 100_000, ttlSeconds: 3600 }) },
 ];
 
-const REQUEST_COUNTS = [1_000, 10_000];
+const targetArg = process.argv[2];
+const concurrencyArg = process.argv[3];
+const REQUEST_COUNTS = targetArg ? [parseInt(targetArg, 10)] : [1_000, 10_000, 100_000];
+const CONCURRENCY = concurrencyArg ? parseInt(concurrencyArg, 10) : 50;
+
 
 // ---------------------------------------------------------------------------
 // Table rendering
@@ -101,7 +105,7 @@ async function main() {
     for (const scenario of SCENARIOS) {
       process.stdout.write(`  Benchmarking ${scenario.name} @ ${count.toLocaleString()} requests... `);
       const limiter = scenario.factory();
-      const result = await runBenchmark(scenario.name, limiter, count, 25);
+      const result = await runBenchmark(scenario.name, limiter, count, CONCURRENCY);
       allResults.push(result);
       console.log(`${result.requestsPerSec} req/s  (P99 ${result.p99LatencyMs.toFixed(1)}ms)`);
     }

@@ -14,7 +14,7 @@
 
 - **Atomic Redis Transactions:** Executed entirely via Lua scripts (`EVALSHA` with automatic `NOSCRIPT` reload retry) to ensure zero race conditions across multi-instance deployments without distributed lock overhead.
 - **6 Supported Algorithms:** Token Bucket, Fixed Window, Sliding Window Log, Sliding Window Counter, Leaky Bucket, and Generic Cell Rate Algorithm (GCRA).
-- **High Throughput & Low Latency:** Benchmarked at **100,000+ RPS per node** with **P99 latencies < 0.5ms**.
+- **High Throughput & Low Latency:** Benchmarked at **190,000+ RPS per node** with **P99 latencies < 0.8ms**.
 - **Advanced Composition:** Built-in support for **Composite Rate Limiters** (evaluating multiple rules sequentially) and **Hierarchical Rate Limiters** (multi-level org/team/user policies).
 - **Weighted Requests:** Dynamic cost billing per endpoint (e.g., `GET = 1`, `POST = 5`, `AI Endpoint = 100`).
 - **Resilient Failure Separation:** Express middleware cleanly separates rate-limit enforcement (`429 Too Many Requests`) from infrastructure outages (`503 Service Unavailable`).
@@ -176,23 +176,23 @@ const result = await composite.consume('throttlex:rl:user:12345');
 Run the built-in benchmarking harness to profile performance under simulated load:
 
 ```bash
-npm run benchmark
+# Run benchmark suite with custom request count and concurrency
+npx ts-node benchmarks/benchmarkRunner.ts 100000 50
 ```
 
-### Sample Benchmark Results (25 Concurrent Connections)
+### Benchmark Results (100,000 Requests @ 50 Concurrency)
 
 ```
-=================================== ThrottleX Benchmark ===================================
-
+---------------------------------------------------------------------------------------------------
 Algorithm                | Requests   | Req/s      | Mean ms    | P50 ms     | P95 ms     | P99 ms     
--------------------------+------------+------------+------------+------------+------------+-----------
-token-bucket             | 10,000     | 108,680    | 0.13       | 0.12       | 0.19       | 0.28       
-fixed-window             | 10,000     | 130,837    | 0.11       | 0.09       | 0.20       | 0.38       
-sliding-window-log       | 10,000     | 100,043    | 0.15       | 0.15       | 0.21       | 0.33       
-sliding-window-counter   | 10,000     | 119,731    | 0.13       | 0.12       | 0.17       | 0.29       
-leaky-bucket             | 10,000     | 118,425    | 0.13       | 0.13       | 0.18       | 0.28       
-gcra                     | 10,000     | 127,780    | 0.12       | 0.12       | 0.17       | 0.25       
--------------------------+------------+------------+------------+------------+------------+-----------
+-------------------------+------------+------------+------------+------------+------------+--------
+token-bucket             | 100000     | 130171     | 0.21       | 0.18       | 0.26       | 0.77       
+fixed-window             | 100000     | 190075     | 0.13       | 0.12       | 0.17       | 0.21       
+sliding-window-log       | 100000     | 113590     | 0.24       | 0.22       | 0.31       | 0.41       
+sliding-window-counter   | 100000     | 141313     | 0.18       | 0.18       | 0.23       | 0.29       
+leaky-bucket             | 100000     | 134462     | 0.20       | 0.19       | 0.32       | 0.48       
+gcra                     | 100000     | 155472     | 0.16       | 0.16       | 0.21       | 0.35       
+---------------------------------------------------------------------------------------------------
 ```
 
 ---
