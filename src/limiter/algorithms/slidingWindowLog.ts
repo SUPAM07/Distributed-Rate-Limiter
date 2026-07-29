@@ -1,5 +1,7 @@
 import { BaseRateLimiter } from '../base/baseRateLimiter';
 import type { RateLimiter, RateLimiterResult } from '../types';
+import { requirePositiveNumber, requireGreaterThanOrEqual } from '../validators/configValidator';
+import { calculateRetryAfterMsForWindow } from '../retry/retryAfter';
 
 export interface SlidingWindowLogConfig {
   limit: number;
@@ -7,72 +9,15 @@ export interface SlidingWindowLogConfig {
   ttlSeconds: number;
 }
 
-// ---------------------------------------------------------------------------
-// Lua Script
-// ---------------------------------------------------------------------------
-// KEYS[1] - the rate-limit Redis key
-// ARGV[1] - limit
-// ARGV[2] - now
-// ARGV[3] - windowStartMs
-// ARGV[4] - ttlSeconds
-// ARGV[5] - uniqueMemberId
-// ARGV[6] - weight
-// ---------------------------------------------------------------------------
-const SLIDING_WINDOW_LOG_LUA = `
-local key = KEYS[1]
-local limit = tonumber(ARGV[1])
-local now = tonumber(ARGV[2])
-local windowStart = tonumber(ARGV[3])
-local ttl = tonumber(ARGV[4])
-local memberId = ARGV[5]
-local weight = tonumber(ARGV[6])
-
-redis.call('ZREMRANGEBYSCORE', key, '-inf', windowStart)
-
-local count = tonumber(redis.call('ZCARD', key) or "0")
-
-local allowed = 0
-local remaining = 0
-
-if count + weight <= limit then
-  -- Add one entry per weight unit to correctly track capacity
-  -- We batch them into a single ZADD call for efficiency
-  local zaddArgs = {}
-  for i=1, weight do
-    table.insert(zaddArgs, now)
-    table.insert(zaddArgs, memberId .. '-' .. i)
-  end
-  if #zaddArgs > 0 then
-    redis.call('ZADD', key, unpack(zaddArgs))
-    redis.call('EXPIRE', key, ttl)
-  end
-  allowed = 1
-  remaining = limit - count - weight
-else
-  allowed = 0
-  remaining = math.max(0, limit - count)
-end
-
-local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
-local oldestScore = 0
-if oldest[2] then
-  oldestScore = tonumber(oldest[2])
-end
-
-return { allowed, remaining, oldestScore }
-`;
-
 export class SlidingWindowLog extends BaseRateLimiter implements RateLimiter {
-  protected readonly LUA_SCRIPT = SLIDING_WINDOW_LOG_LUA;
+  protected readonly LUA_SCRIPT_FILENAME = 'slidingWindowLog.lua';
   private readonly config: SlidingWindowLogConfig;
 
   constructor(config: SlidingWindowLogConfig) {
     super();
-    if (config.limit <= 0) throw new Error('SlidingWindowLog: limit must be > 0');
-    if (config.windowSeconds <= 0) throw new Error('SlidingWindowLog: windowSeconds must be > 0');
-    if (config.ttlSeconds < config.windowSeconds) {
-      throw new Error('SlidingWindowLog: ttlSeconds must be >= windowSeconds');
-    }
+    requirePositiveNumber(config.limit, 'limit', 'SlidingWindowLog');
+    requirePositiveNumber(config.windowSeconds, 'windowSeconds', 'SlidingWindowLog');
+    requireGreaterThanOrEqual(config.ttlSeconds, config.windowSeconds, 'ttlSeconds', 'windowSeconds', 'SlidingWindowLog');
     this.config = config;
   }
 
@@ -98,10 +43,7 @@ export class SlidingWindowLog extends BaseRateLimiter implements RateLimiter {
     const oldestScore = oldestScoreRaw;
 
     const resetAtMs = oldestScore > 0 ? oldestScore + windowMs : now;
-    let retryAfterMs = 0;
-    if (!allowed) {
-      retryAfterMs = Math.max(0, resetAtMs - now);
-    }
+    const retryAfterMs = calculateRetryAfterMsForWindow(allowed, resetAtMs, now);
 
     return { allowed, remaining, resetAtMs, retryAfterMs };
   }
