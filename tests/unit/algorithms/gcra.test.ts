@@ -1,7 +1,7 @@
 import Redis from 'ioredis';
-import { buildRateLimitKey } from '../src/redis/keys';
-import { GCRA } from '../src/limiter/algorithms/gcra';
-import { closeRedisClient } from '../src/redis/client';
+import { buildRateLimitKey } from '../../src/redis/keys';
+import { GCRA } from '../../src/limiter/algorithms/gcra';
+import { closeRedisClient } from '../../src/redis/client';
 
 const RUN_ID = `test-gcra-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
