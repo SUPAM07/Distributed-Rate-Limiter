@@ -1,5 +1,5 @@
-import { CompositeRateLimiter } from '../src/limiter/compositeRateLimiter';
-import type { RateLimiter } from '../src/limiter/types';
+import { CompositeRateLimiter } from '../../src/limiter/compositeRateLimiter';
+import type { RateLimiter } from '../../src/limiter/types';
 
 describe('CompositeRateLimiter', () => {
   it('throws if no limiters provided', () => {
