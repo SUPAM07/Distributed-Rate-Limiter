@@ -237,7 +237,12 @@ npm run test:coverage
 │   ├── redis/               # Singleton ioredis client & key builder
 │   ├── routes/              # Express health & test routes
 │   └── app.ts               # Express application factory
-└── tests/                   # Unit, Integration, Concurrency, Boundary, & Failure test suites
+└── tests/                   # Clean 5-tier test suite
+    ├── unit/                # Unit tests (algorithms/, limiter/, config, middleware, redisKeys)
+    ├── integration/         # End-to-end API integration tests
+    ├── concurrency/         # Parallel race-condition testing
+    ├── boundary/            # Limit boundary & edge-case testing
+    └── failure/             # Infrastructure resilience & fault-tolerance testing
 ```
 
 ---
