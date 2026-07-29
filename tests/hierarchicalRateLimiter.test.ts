@@ -1,5 +1,5 @@
 import { HierarchicalRateLimiter } from '../src/limiter/hierarchicalRateLimiter';
-import type { RateLimiter, RateLimiterResult } from '../src/limiter/types';
+import type { RateLimiter } from '../src/limiter/types';
 
 describe('HierarchicalRateLimiter', () => {
   it('throws if no limiters provided', () => {
