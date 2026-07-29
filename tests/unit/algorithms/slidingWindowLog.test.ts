@@ -1,7 +1,7 @@
 import Redis from 'ioredis';
-import { buildRateLimitKey } from '../src/redis/keys';
-import { SlidingWindowLog } from '../src/limiter/algorithms/slidingWindowLog';
-import { closeRedisClient } from '../src/redis/client';
+import { buildRateLimitKey } from '../../src/redis/keys';
+import { SlidingWindowLog } from '../../src/limiter/algorithms/slidingWindowLog';
+import { closeRedisClient } from '../../src/redis/client';
 
 const RUN_ID = `test-swl-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
