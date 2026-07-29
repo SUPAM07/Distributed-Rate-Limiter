@@ -1,10 +1,10 @@
 import Redis from 'ioredis';
-import { buildRateLimitKey } from '../src/redis/keys';
-import { TokenBucket } from '../src/limiter/algorithms/tokenBucket';
-import { FixedWindow } from '../src/limiter/algorithms/fixedWindow';
-import { SlidingWindowLog } from '../src/limiter/algorithms/slidingWindowLog';
-import { GCRA } from '../src/limiter/algorithms/gcra';
-import { closeRedisClient } from '../src/redis/client';
+import { buildRateLimitKey } from '../../src/redis/keys';
+import { TokenBucket } from '../../src/limiter/algorithms/tokenBucket';
+import { FixedWindow } from '../../src/limiter/algorithms/fixedWindow';
+import { SlidingWindowLog } from '../../src/limiter/algorithms/slidingWindowLog';
+import { GCRA } from '../../src/limiter/algorithms/gcra';
+import { closeRedisClient } from '../../src/redis/client';
 
 const RUN_ID = `test-weights-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
