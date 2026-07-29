@@ -1,5 +1,6 @@
 import Redis from 'ioredis';
 import { config } from '../config/env';
+import { logger } from '../shared/logger';
 
 let client: Redis | null = null;
 
@@ -26,36 +27,18 @@ export function getRedisClient(): Redis {
   });
 
   client.on('connect', () => {
-    console.log(
-      JSON.stringify({
-        level: 'info',
-        event: 'redis.connect',
-        host: config.redis.host,
-        port: config.redis.port,
-        ts: new Date().toISOString(),
-      }),
-    );
+    logger.info('redis.connect', {
+      host: config.redis.host,
+      port: config.redis.port,
+    });
   });
 
   client.on('ready', () => {
-    console.log(
-      JSON.stringify({
-        level: 'info',
-        event: 'redis.ready',
-        ts: new Date().toISOString(),
-      }),
-    );
+    logger.info('redis.ready');
   });
 
   client.on('error', (err: Error) => {
-    console.error(
-      JSON.stringify({
-        level: 'error',
-        event: 'redis.error',
-        message: err.message,
-        ts: new Date().toISOString(),
-      }),
-    );
+    logger.error('redis.error', err.message);
   });
 
   return client;
