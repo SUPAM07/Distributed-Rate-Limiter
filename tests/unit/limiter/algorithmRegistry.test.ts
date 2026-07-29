@@ -1,10 +1,10 @@
-import { AlgorithmRegistry, type RegistryConfig } from '../src/limiter/algorithmRegistry';
-import { TokenBucket } from '../src/limiter/algorithms/tokenBucket';
-import { FixedWindow } from '../src/limiter/algorithms/fixedWindow';
-import { SlidingWindowLog } from '../src/limiter/algorithms/slidingWindowLog';
-import { SlidingWindowCounter } from '../src/limiter/algorithms/slidingWindowCounter';
-import { LeakyBucket } from '../src/limiter/algorithms/leakyBucket';
-import { GCRA } from '../src/limiter/algorithms/gcra';
+import { AlgorithmRegistry, type RegistryConfig } from '../../src/limiter/algorithmRegistry';
+import { TokenBucket } from '../../src/limiter/algorithms/tokenBucket';
+import { FixedWindow } from '../../src/limiter/algorithms/fixedWindow';
+import { SlidingWindowLog } from '../../src/limiter/algorithms/slidingWindowLog';
+import { SlidingWindowCounter } from '../../src/limiter/algorithms/slidingWindowCounter';
+import { LeakyBucket } from '../../src/limiter/algorithms/leakyBucket';
+import { GCRA } from '../../src/limiter/algorithms/gcra';
 
 const baseConfig: RegistryConfig = {
   rateLimit: {
