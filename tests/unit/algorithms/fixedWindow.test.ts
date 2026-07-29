@@ -1,7 +1,7 @@
 import Redis from 'ioredis';
-import { buildRateLimitKey } from '../src/redis/keys';
-import { FixedWindow } from '../src/limiter/algorithms/fixedWindow';
-import { closeRedisClient } from '../src/redis/client';
+import { buildRateLimitKey } from '../../src/redis/keys';
+import { FixedWindow } from '../../src/limiter/algorithms/fixedWindow';
+import { closeRedisClient } from '../../src/redis/client';
 
 const RUN_ID = `test-fw-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
