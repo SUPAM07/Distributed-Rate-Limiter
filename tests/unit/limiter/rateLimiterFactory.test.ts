@@ -1,12 +1,12 @@
-import { createRateLimiter } from '../src/limiter/createRateLimiter';
-import { TokenBucket } from '../src/limiter/algorithms/tokenBucket';
-import { FixedWindow } from '../src/limiter/algorithms/fixedWindow';
-import { SlidingWindowLog } from '../src/limiter/algorithms/slidingWindowLog';
-import { SlidingWindowCounter } from '../src/limiter/algorithms/slidingWindowCounter';
-import { config, AlgorithmType } from '../src/config/env';
+import { createRateLimiter } from '../../src/limiter/createRateLimiter';
+import { TokenBucket } from '../../src/limiter/algorithms/tokenBucket';
+import { FixedWindow } from '../../src/limiter/algorithms/fixedWindow';
+import { SlidingWindowLog } from '../../src/limiter/algorithms/slidingWindowLog';
+import { SlidingWindowCounter } from '../../src/limiter/algorithms/slidingWindowCounter';
+import { config, AlgorithmType } from '../../src/config/env';
 
-jest.mock('../src/config/env', () => {
-  const original = jest.requireActual('../src/config/env');
+jest.mock('../../src/config/env', () => {
+  const original = jest.requireActual('../../src/config/env');
   return {
     ...original,
     config: {
