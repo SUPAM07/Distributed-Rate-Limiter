@@ -1,5 +1,5 @@
 import request from 'supertest';
-import { app } from '../../src/app';
+
 import { AlgorithmRegistry } from '../../src/limiter/algorithmRegistry';
 import type { RegistryConfig } from '../../src/limiter/algorithmRegistry';
 import { closeRedisClient } from '../../src/redis/client';
@@ -24,11 +24,10 @@ describe('Failure — Redis error produces 503', () => {
     // We inject the limiter directly via a test-only route approach.
     // Since the middleware singleton is already created, we test through
     // a mock middleware that simulates the error path:
-    const mockMiddleware = async (req: any, res: any, next: any) => {
+    const mockMiddleware = async (_req: any, res: any, _next: any) => {
       try {
         throw new Error('ECONNREFUSED — mocked Redis failure');
       } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : 'Redis error';
         res.status(503).json({
           error: 'Service temporarily unavailable',
           code: 'RATE_LIMITER_UNAVAILABLE',
@@ -40,7 +39,7 @@ describe('Failure — Redis error produces 503', () => {
     // Verify the shape we expect the middleware to emit
     const express = require('express');
     const mockApp = express();
-    mockApp.get('/test', mockMiddleware, (req: any, res: any) => res.json({ ok: true }));
+    mockApp.get('/test', mockMiddleware, (_req: any, res: any) => res.json({ ok: true }));
 
     const res = await request(mockApp).get('/test');
     expect(res.status).toBe(503);
