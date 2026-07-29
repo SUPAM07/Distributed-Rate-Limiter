@@ -1,7 +1,7 @@
 import Redis from 'ioredis';
-import { buildRateLimitKey } from '../src/redis/keys';
-import { LeakyBucket } from '../src/limiter/algorithms/leakyBucket';
-import { closeRedisClient } from '../src/redis/client';
+import { buildRateLimitKey } from '../../src/redis/keys';
+import { LeakyBucket } from '../../src/limiter/algorithms/leakyBucket';
+import { closeRedisClient } from '../../src/redis/client';
 
 const RUN_ID = `test-lb-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
