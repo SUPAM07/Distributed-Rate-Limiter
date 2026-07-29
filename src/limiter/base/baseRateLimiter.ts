@@ -1,10 +1,11 @@
 import type Redis from 'ioredis';
 import { getRedisClient } from '../../redis/client';
+import { loadLuaScript } from '../lua/luaLoader';
 
 export abstract class BaseRateLimiter {
   protected readonly redis: Redis;
   private scriptSha: string | null = null;
-  protected abstract readonly LUA_SCRIPT: string;
+  protected abstract readonly LUA_SCRIPT_FILENAME: string;
 
   constructor() {
     this.redis = getRedisClient();
@@ -18,7 +19,8 @@ export abstract class BaseRateLimiter {
    */
   protected async evalScript<T = unknown>(numKeys: number, args: (string | number)[]): Promise<T> {
     const load = async (): Promise<string> => {
-      const sha = await this.redis.script('LOAD', this.LUA_SCRIPT) as string;
+      const script = loadLuaScript(this.LUA_SCRIPT_FILENAME);
+      const sha = await this.redis.script('LOAD', script) as string;
       this.scriptSha = sha;
       return sha;
     };
