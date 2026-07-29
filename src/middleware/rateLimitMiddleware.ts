@@ -2,6 +2,8 @@ import type { Request, Response, NextFunction } from 'express';
 import { createRateLimiter } from '../limiter/createRateLimiter';
 import { buildRateLimitKey } from '../redis/keys';
 import { config } from '../config/env';
+import { logger } from '../shared/logger';
+import { setRateLimitHeaders } from '../limiter/headers/rateLimitHeaders';
 
 // ---------------------------------------------------------------------------
 // Singleton limiter instance shared across all requests.
@@ -40,14 +42,7 @@ export async function rateLimitMiddleware(
   } catch (err: unknown) {
     // Architecture rule 8: infrastructure failures must be distinguishable from rate-limit rejection.
     const message = err instanceof Error ? err.message : 'Redis error';
-    console.error(
-      JSON.stringify({
-        level: 'error',
-        event: 'rate_limit.redis_error',
-        message,
-        ts: new Date().toISOString(),
-      }),
-    );
+    logger.error('rate_limit.redis_error', message);
     res.status(503).json({
       error: 'Service temporarily unavailable',
       code: 'RATE_LIMITER_UNAVAILABLE',
@@ -55,16 +50,13 @@ export async function rateLimitMiddleware(
     return;
   }
 
-  // Set standard rate-limit headers on every response.
-  res.setHeader('X-RateLimit-Limit', config.rateLimit.algorithm === 'token-bucket' ? config.rateLimit.capacity : config.rateLimit.limit);
-  res.setHeader('X-RateLimit-Remaining', result.remaining);
-  res.setHeader(
-    'X-RateLimit-Reset',
-    Math.ceil(result.resetAtMs / 1000), // Unix seconds
-  );
+  const limit = config.rateLimit.algorithm === 'token-bucket' 
+    ? config.rateLimit.capacity 
+    : config.rateLimit.limit;
+    
+  setRateLimitHeaders(res, result, limit);
 
   if (!result.allowed) {
-    res.setHeader('Retry-After', Math.ceil(result.retryAfterMs / 1000));
     res.status(429).json({
       error: 'Too Many Requests',
       code: 'RATE_LIMIT_EXCEEDED',
